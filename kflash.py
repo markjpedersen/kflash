@@ -714,33 +714,32 @@ class KFlash:
 
             #dan dock
             def reset_to_isp_dan(self):
-                self._port.setDTR (False)
-                self._port.setRTS (False)
-                time.sleep(0.1)
-                #KFlash.log('-- RESET to LOW, IO16 to HIGH --')
-                # Pull reset down and keep 10ms
-                self._port.setDTR (False)
-                self._port.setRTS (True)
-                time.sleep(0.1)
-                #KFlash.log('-- IO16 to LOW, RESET to HIGH --')
-                # Pull IO16 to low and release reset
-                self._port.setRTS (False)
+
+                # Pull RESET and IO_16 down and keep 10ms.
+
                 self._port.setDTR (True)
-                time.sleep(0.1)
-            def reset_to_boot_dan(self):
-                self._port.setDTR (False)
+                self._port.setRTS (True)
+                time.sleep(0.01)
+
+                # Release RESET, leaving IO_16 low to enter ISP mode.
+
+                self._port.setDTR (True)
                 self._port.setRTS (False)
-                time.sleep(0.1)
-                #KFlash.log('-- RESET to LOW --')
-                # Pull reset down and keep 10ms
+                time.sleep(0.01)
+
+            def reset_to_boot_dan(self):
+
+                # Pull RESET down and keep 10ms.
+
                 self._port.setDTR (False)
                 self._port.setRTS (True)
-                time.sleep(0.1)
-                #KFlash.log('-- RESET to HIGH, BOOT --')
-                # Pull IO16 to low and release reset
-                self._port.setRTS (False)
+                time.sleep(0.01)
+
+                # Release RESET, leaving IO_16 high to boot from flash.
+
                 self._port.setDTR (False)
-                time.sleep(0.1)
+                self._port.setRTS (False)
+                time.sleep(0.01)
 
             # maix goD for old cmsis-dap firmware
             def reset_to_isp_goD(self):
@@ -790,6 +789,7 @@ class KFlash:
 
             def greeting(self):
                 self._port.write(b'\xc0\xc2\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xc0')
+                time.sleep(0.1)
                 op, reason, text = ISPResponse.parse(self.recv_one_return())
 
                 #KFlash.log('MAIX return op:', ISPResponse.ISPOperation(op).name, 'reason:', ISPResponse.ErrorCode(reason).name)

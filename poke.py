@@ -8,54 +8,70 @@
 
 import time
 import serial
+from enum import Enum
 
 def log(*args, **kwargs):
     print(*args, **kwargs)
     
 def slip_reader(port):
     
-    partial_packet = None
+    packet = b''
     in_escape = False
 
-    # We need to listen until we get a full packet, closed by \xc0.
+    # First, listen for a packet start token, \xc0.  It needs to
+    # arrive within a serial read timeout.  If it doesn't, or we get
+    # anything else, throw an exception.
+
+    buf = port.read(1)
+    if buf != b'\xc0':
+        raise Exception("SLIP read wrong start token: ", buf[0])
     
-    while True:
+    # Listen until we get a full packet, terminated by \xc0.
+    
+    buf += port.read_until(b'\xc0', port.in_waiting)
+    #log("read", len(buf), "bytes: ", str(buf))
 
-        waiting = port.in_waiting
-#        read_bytes = port.read(1 if waiting == 0 else waiting)
-        read_bytes = port.read(port.in_waiting)
-        if read_bytes == b'':
-            raise Exception("Timed out waiting for packet %s"
-                            % ("header" if partial_packet is None else "content"))
+    # Now translate any SLIP escape sequences and ditch the
+    # start and stop tokens.
 
-        log("read", len(read_bytes), "bytes: ", str(read_bytes))
-        
-        for b in read_bytes:
+    packet = buf[1:-1].replace(b'\xdb\xdc', b'\xc0').replace(b'\xdb\xdd', b'\xdb')
+    yield packet
+    
 
-            if type(b) is int:
-                b = bytes([b])  # python 2/3 compat
+class ISPResponse:
 
-            if partial_packet is None:  # waiting for packet header
-                if b == b'\xc0':
-                    partial_packet = b""
-                else:
-                    raise Exception('Invalid head of packet (%r)' % b)
-            elif in_escape:  # part-way through escape sequence
-                in_escape = False
-                if b == b'\xdc':
-                    partial_packet += b'\xc0'
-                elif b == b'\xdd':
-                    partial_packet += b'\xdb'
-                else:
-                    raise Exception('Invalid SLIP escape (%r%r)' % (b'\xdb', b))
-            elif b == b'\xdb':  # start of escape sequence
-                in_escape = True
-            elif b == b'\xc0':  # end of packet
-                yield partial_packet
-                partial_packet = None
-            else:  # normal byte in packet
-                partial_packet += b
+    class Operation(Enum):
+        ISP_ECHO = 0xC1
+        ISP_NOP = 0xC2
+        ISP_MEMORY_WRITE = 0xC3
+        ISP_MEMORY_READ = 0xC4
+        ISP_MEMORY_BOOT = 0xC5
+        ISP_DEBUG_INFO = 0xD1
+        ISP_CHANGE_BAUDRATE = 0xc6
 
+    class Error(Enum):
+        ISP_RET_DEFAULT = 0
+        ISP_RET_OK = 0xE0
+        ISP_RET_BAD_DATA_LEN = 0xE1
+        ISP_RET_BAD_DATA_CHECKSUM = 0xE2
+        ISP_RET_INVALID_COMMAND = 0xE3
+
+    @staticmethod
+    def parse(data):
+
+        # type: (bytes) -> (int, int, str)
+
+        op = int(data[0])
+        reason = int(data[1])
+        text = ''
+
+        try:
+            if ISPResponse.Operation(op) == ISPResponse.Operation.ISP_DEBUG_INFO:
+                text = data[2:].decode()
+        except ValueError:
+            KFlash.log('Warning: recv unknown op', op)
+
+        return (op, reason, text)
 
 class MAIXLoader:
 
@@ -74,9 +90,6 @@ class MAIXLoader:
         
         log("Default baudrate is", baudrate)
 
-        self._port.isOpen()
-#        self.readPacket = slip_reader(self._port)
-
     def reset_to_isp_dan(self):
 
         # Pull RESET and IO_16 down and keep 10ms.
@@ -93,34 +106,59 @@ class MAIXLoader:
 
     def reset_to_boot_dan(self):
 
-        self._port.setDTR (False)
-        self._port.setRTS (False)
-        time.sleep(0.1)
-
-        # Pull reset down and keep 10ms
+        # Pull RESET down and keep 10ms.
+        
         self._port.setDTR (False)
         self._port.setRTS (True)
-        time.sleep(0.1)
+        time.sleep(0.01)
 
-        # Pull IO16 to low and release reset
-        self._port.setRTS (False)
+        # Release RESET, leaving IO_16 high to boot from flash.
+        
         self._port.setDTR (False)
-        time.sleep(0.1)
+        self._port.setRTS (False)
+        time.sleep(0.01)
+
+    def write(self, packet):
+        buf = b'\xc0' \
+              + (packet.replace(b'\xdb', b'\xdb\xdd').replace(b'\xc0', b'\xdb\xdc')) \
+              + b'\xc0'
+        #KFlash.log('[WRITE]', binascii.hexlify(buf))
+        return self._port.write(buf)
 
     def read(self):
-        return next(slip_reader(self._port))
-        
+
+        # First, listen for a packet start token, \xc0.  It needs to
+        # arrive within a serial read timeout.  If it doesn't, or we get
+        # anything else, throw an exception.
+
+        buf = self._port.read(1)
+        if buf != b'\xc0':
+            raise Exception("SLIP read wrong start token: ", buf[0])
+
+        # Listen until we get a full packet, terminated by \xc0.
+
+        buf += self._port.read_until(b'\xc0', self._port.in_waiting)
+        #log("read", len(buf), "bytes: ", str(buf))
+
+        # Now translate any SLIP escape sequences and ditch the
+        # start and stop tokens.
+
+        packet = buf[1:-1].replace(b'\xdb\xdc', b'\xc0').replace(b'\xdb\xdd', b'\xdb')
+        return packet
+
     def greeting(self):
         self._port.write(b'\xc0\xc2\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xc0')
         time.sleep(0.1)
-        text = self.read()
-        log('MAIX returned: ', str(text))
-
+        reply = self.read()
+        log('MAIX returned: ', str(reply))
+        op, reason, text = ISPResponse.parse(reply)
+        log('ISP response:', ISPResponse.Operation(op).name,
+            ISPResponse.Error(reason).name, text)
 
 
 l = MAIXLoader('/dev/ttyUSB0', baudrate=115200)
 
 l.reset_to_isp_dan()
 l.greeting()
-l.reset_to_boot_dan()
+#l.reset_to_boot_dan()
 
