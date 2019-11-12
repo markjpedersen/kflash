@@ -8,37 +8,16 @@
 
 import time
 import serial
+import binascii
 from enum import Enum
+import struct
+
 
 def log(*args, **kwargs):
     print(*args, **kwargs)
     
-def slip_reader(port):
-    
-    packet = b''
-    in_escape = False
 
-    # First, listen for a packet start token, \xc0.  It needs to
-    # arrive within a serial read timeout.  If it doesn't, or we get
-    # anything else, throw an exception.
-
-    buf = port.read(1)
-    if buf != b'\xc0':
-        raise Exception("SLIP read wrong start token: ", buf[0])
-    
-    # Listen until we get a full packet, terminated by \xc0.
-    
-    buf += port.read_until(b'\xc0', port.in_waiting)
-    #log("read", len(buf), "bytes: ", str(buf))
-
-    # Now translate any SLIP escape sequences and ditch the
-    # start and stop tokens.
-
-    packet = buf[1:-1].replace(b'\xdb\xdc', b'\xc0').replace(b'\xdb\xdd', b'\xdb')
-    yield packet
-    
-
-class ISPResponse:
+class ISP:
 
     class Operation(Enum):
         ISP_ECHO = 0xC1
@@ -56,6 +35,9 @@ class ISPResponse:
         ISP_RET_BAD_DATA_CHECKSUM = 0xE2
         ISP_RET_INVALID_COMMAND = 0xE3
 
+    cmd = struct.Struct('<HHIII')
+    DebugCmd = struct.pack('<HH', 0xd1, 0)
+    
     @staticmethod
     def parse(data):
 
@@ -66,7 +48,7 @@ class ISPResponse:
         text = ''
 
         try:
-            if ISPResponse.Operation(op) == ISPResponse.Operation.ISP_DEBUG_INFO:
+            if ISP.Operation(op) == ISP.Operation.ISP_DEBUG_INFO:
                 text = data[2:].decode()
         except ValueError:
             KFlash.log('Warning: recv unknown op', op)
@@ -86,7 +68,7 @@ class MAIXLoader:
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
             bytesize=serial.EIGHTBITS,
-            timeout=0.1)
+            timeout=1)
         
         log("Default baudrate is", baudrate)
 
@@ -122,7 +104,7 @@ class MAIXLoader:
         buf = b'\xc0' \
               + (packet.replace(b'\xdb', b'\xdb\xdd').replace(b'\xc0', b'\xdb\xdc')) \
               + b'\xc0'
-        #KFlash.log('[WRITE]', binascii.hexlify(buf))
+        log('[WRITE]', binascii.hexlify(buf))
         return self._port.write(buf)
 
     def read(self):
@@ -137,8 +119,8 @@ class MAIXLoader:
 
         # Listen until we get a full packet, terminated by \xc0.
 
-        buf += self._port.read_until(b'\xc0', self._port.in_waiting)
-        #log("read", len(buf), "bytes: ", str(buf))
+        buf += self._port.read_until('\xff', self._port.in_waiting)
+        log("read", len(buf), "bytes: ", str(buf))
 
         # Now translate any SLIP escape sequences and ditch the
         # start and stop tokens.
@@ -146,19 +128,27 @@ class MAIXLoader:
         packet = buf[1:-1].replace(b'\xdb\xdc', b'\xc0').replace(b'\xdb\xdd', b'\xdb')
         return packet
 
-    def greeting(self):
-        self._port.write(b'\xc0\xc2\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xc0')
-        time.sleep(0.1)
+    def poke(self):
+
+        # buf = ISP.cmd.pack(0xc2, 0, 0, 0, 0)
+        adrs = 0x80000000
+        n = 10
+        crc = binascii.crc32(struct.pack('<II', adrs, n)) & 0xffffffff
+        log('crc: ', hex(crc))
+        buf = ISP.cmd.pack(0xc4, 0, crc, adrs, n)
+        log('xmit buf: ', str(buf))
+        self.write(buf)
+        time.sleep(1)
         reply = self.read()
         log('MAIX returned: ', str(reply))
-        op, reason, text = ISPResponse.parse(reply)
-        log('ISP response:', ISPResponse.Operation(op).name,
-            ISPResponse.Error(reason).name, text)
+        op, reason, text = ISP.parse(reply)
+        log('ISP response:', ISP.Operation(op).name,
+            ISP.Error(reason).name, text)
 
 
 l = MAIXLoader('/dev/ttyUSB0', baudrate=115200)
 
 l.reset_to_isp_dan()
-l.greeting()
-#l.reset_to_boot_dan()
+l.poke()
+l.reset_to_boot_dan()
 
